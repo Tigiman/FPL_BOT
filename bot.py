@@ -24,6 +24,14 @@ TIMEZONES = [
     ("Израиль", "Asia/Jerusalem"),
 ]
 
+# Доп. уведомления, которые уходят отдельными сообщениями сразу после
+# каждого классического напоминания (и за 24ч, и за 2ч). Без времени дедлайна —
+# просто пинг конкретных людей.
+EXTRA_NOTICES = [
+    "@smager14 @adkavalchuk @v_nltsk @SurgeonWes напоминание про Challenge!",
+    "@adkavalchuk @v_nltsk @SurgeonWes напоминание про Драфт!",
+]
+
 FPL_API = "https://fantasy.premierleague.com/api/bootstrap-static/"
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -89,7 +97,7 @@ async def fetch_gw_deadline(gw_id: int) -> tuple[str, datetime] | None:
     return None
 
 
-# ─── СООБЩЕНИЕ ───────────────────────────────────────────────────────────────
+# ─── СООБЩЕНИЯ ───────────────────────────────────────────────────────────────
 def format_message(gw_name: str, deadline: datetime) -> str:
     remaining = deadline - datetime.now(timezone.utc)
     hours_left = max(0, round(remaining.total_seconds() / 3600))
@@ -105,11 +113,16 @@ def format_message(gw_name: str, deadline: datetime) -> str:
 async def send_and_mark(state: dict, key: str, gw_name: str, deadline: datetime):
     if state.get(key):
         return  # уже отправлено — защита от гонки scheduler vs. sync_reminders
+
     text = format_message(gw_name, deadline)
     await bot.send_message(chat_id=CHAT_ID, text=text)
+
+    for notice in EXTRA_NOTICES:
+        await bot.send_message(chat_id=CHAT_ID, text=notice)
+
     state[key] = True
     save_state(state)
-    log.info(f"Отправлено: {key}")
+    log.info(f"Отправлено: {key} (+ {len(EXTRA_NOTICES)} доп. уведомления)")
 
 
 # ─── ТОЧНЫЙ JOB (аналог старого scheduler.add_job, но с перепроверкой) ──────
