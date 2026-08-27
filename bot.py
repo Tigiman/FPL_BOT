@@ -195,7 +195,14 @@ async def main():
     _scheduler = AsyncIOScheduler(timezone="UTC")
     _scheduler.start()
 
-    await sync_reminders(state)
+    try:
+        await sync_reminders(state)
+    except Exception:
+        log.exception(
+            "Ошибка при первой синхронизации — процесс не падаю, "
+            "попробую снова по расписанию (или после исправления конфига и рестарта)."
+        )
+
     _scheduler.add_job(sync_reminders, "interval", hours=RECHECK_INTERVAL_HOURS, args=[state])
 
     while True:
