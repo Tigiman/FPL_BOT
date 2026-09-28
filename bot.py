@@ -1,19 +1,23 @@
+"""FPL Deadline Reminder — однократный запуск.
+
+Скрипт делает одну проверку и завершается. Запускается по расписанию
+из GitHub Actions (.github/workflows/remind.yml). Состояние (какие
+напоминания уже отправлены) хранится в state.json, который workflow
+коммитит обратно в репозиторий.
+"""
 import os
 import json
-import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import Bot
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-STATE_FILE = os.environ.get("STATE_FILE", "/tmp/fpl_reminder_state.json")
-RECHECK_INTERVAL_HOURS = int(os.environ.get("RECHECK_INTERVAL_HOURS", "6"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+DRY_RUN = os.environ.get("DRY_RUN") == "1"  # печатать вместо отправки
 
 REMIND_HOURS = [24, 2]
 
@@ -38,15 +42,8 @@ FPL_API = "https://fantasy.premierleague.com/api/bootstrap-static/"
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
-_scheduler: AsyncIOScheduler | None = None
 
-
-def get_scheduler() -> AsyncIOScheduler:
-    return _scheduler
-
-
-# ─── STATE (персистентность — фикс бага "тихой пропажи" напоминания) ────────
+# ─── STATE ───────────────────────────────────────────────────────────────────
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
@@ -58,42 +55,20 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    try:
-        d = os.path.dirname(STATE_FILE)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        log.warning(f"Не удалось сохранить state file: {e}")
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
 
 
 # ─── FPL API ─────────────────────────────────────────────────────────────────
-async def fetch_events() -> list[dict]:
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(FPL_API)
-        r.raise_for_status()
-        return r.json()["events"]
-
-
-async def fetch_next_gw() -> tuple[int, str, datetime] | None:
-    events = await fetch_events()
+def fetch_next_gw(client: httpx.Client) -> tuple[int, str, datetime] | None:
+    r = client.get(FPL_API)
+    r.raise_for_status()
     now = datetime.now(timezone.utc)
-    for gw in events:
+    for gw in r.json()["events"]:
         deadline = datetime.fromisoformat(gw["deadline_time"].replace("Z", "+00:00"))
         if not gw["finished"] and deadline > now:
             return gw["id"], gw["name"], deadline
-    return None
-
-
-async def fetch_gw_deadline(gw_id: int) -> tuple[str, datetime] | None:
-    """Свежие данные по конкретному туру — нужно перед отправкой,
-    на случай если дедлайн перенесли после того, как job был запланирован."""
-    events = await fetch_events()
-    for gw in events:
-        if gw["id"] == gw_id:
-            deadline = datetime.fromisoformat(gw["deadline_time"].replace("Z", "+00:00"))
-            return gw["name"], deadline
     return None
 
 
@@ -110,104 +85,64 @@ def format_message(gw_name: str, deadline: datetime) -> str:
     return "\n".join(lines)
 
 
-async def send_and_mark(state: dict, key: str, gw_name: str, deadline: datetime):
-    if state.get(key):
-        return  # уже отправлено — защита от гонки scheduler vs. sync_reminders
-
-    text = format_message(gw_name, deadline)
-    await bot.send_message(chat_id=CHAT_ID, text=text)
-
-    for notice in EXTRA_NOTICES:
-        await bot.send_message(chat_id=CHAT_ID, text=notice)
-
-    state[key] = True
-    save_state(state)
-    log.info(f"Отправлено: {key} (+ {len(EXTRA_NOTICES)} доп. уведомления)")
-
-
-# ─── ТОЧНЫЙ JOB (аналог старого scheduler.add_job, но с перепроверкой) ──────
-async def fire_scheduled(state: dict, gw_id: int, hours: int):
-    key = f"{gw_id}:{hours}"
-    if state.get(key):
+def send_message(client: httpx.Client, text: str):
+    if DRY_RUN:
+        log.info(f"[DRY_RUN] сообщение:\n{text}")
         return
-
-    fresh = await fetch_gw_deadline(gw_id)
-    if fresh is None:
-        return
-    gw_name, deadline = fresh
-    fire_at = deadline - timedelta(hours=hours)
-    now = datetime.now(timezone.utc)
-
-    if now >= fire_at:
-        await send_and_mark(state, key, gw_name, deadline)
-    else:
-        # дедлайн перенесли позже — перепланируем job, а не молчим
-        get_scheduler().add_job(
-            fire_scheduled, trigger="date", run_date=fire_at,
-            args=[state, gw_id, hours], id=key, replace_existing=True,
-        )
-        log.info(f"{gw_name}: дедлайн перенесён, job {key} переставлен на {fire_at}")
+    r = client.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text},
+    )
+    r.raise_for_status()
 
 
-# ─── СИНХРОНИЗАЦИЯ (старт + каждые RECHECK_INTERVAL_HOURS) ──────────────────
-async def sync_reminders(state: dict):
-    """Ставит job'ы на точное время; а если окно уже наступило, пока бот
-    не работал (простой/редеплой) — досылает сразу, а не теряет напоминание."""
-    result = await fetch_next_gw()
-    if result is None:
-        log.info("Активных туров не найдено.")
-        return
-    gw_id, gw_name, deadline = result
-
-    for k in list(state.keys()):
-        if not k.startswith(f"{gw_id}:"):
-            del state[k]
-
-    now = datetime.now(timezone.utc)
-
-    for hours in REMIND_HOURS:
-        key = f"{gw_id}:{hours}"
-        if state.get(key):
-            continue
-
-        fire_at = deadline - timedelta(hours=hours)
-
-        if now >= deadline:
-            state[key] = True  # дедлайн целиком прошёл, слать поздно
-        elif now >= fire_at:
-            await send_and_mark(state, key, gw_name, deadline)
-        else:
-            get_scheduler().add_job(
-                fire_scheduled, trigger="date", run_date=fire_at,
-                args=[state, gw_id, hours], id=key, replace_existing=True,
-            )
-            log.info(f"Запланировано: {gw_name} за {hours} ч. → {fire_at.strftime('%Y-%m-%d %H:%M UTC')}")
-
-    save_state(state)
-
-
-async def main():
-    global _scheduler
-    log.info("FPL Deadline Bot запущен")
+# ─── ОСНОВНАЯ ПРОВЕРКА ───────────────────────────────────────────────────────
+def run():
+    if not DRY_RUN and not (BOT_TOKEN and CHAT_ID):
+        raise SystemExit("Не заданы BOT_TOKEN / CHAT_ID")
 
     state = load_state()
+    now = datetime.now(timezone.utc)
 
-    _scheduler = AsyncIOScheduler(timezone="UTC")
-    _scheduler.start()
+    # Раз в месяц state.json меняется даже без туров (межсезонье), чтобы
+    # workflow сделал коммит — иначе GitHub отключает cron в репозитории
+    # после 60 дней без активности.
+    state["keepalive"] = now.strftime("%Y-%m")
 
-    try:
-        await sync_reminders(state)
-    except Exception:
-        log.exception(
-            "Ошибка при первой синхронизации — процесс не падаю, "
-            "попробую снова по расписанию (или после исправления конфига и рестарта)."
-        )
+    with httpx.Client(timeout=15) as client:
+        result = fetch_next_gw(client)
+        if result is None:
+            log.info("Активных туров не найдено.")
+            save_state(state)
+            return
+        gw_id, gw_name, deadline = result
 
-    _scheduler.add_job(sync_reminders, "interval", hours=RECHECK_INTERVAL_HOURS, args=[state])
+        sent = {k: v for k, v in state.get("sent", {}).items() if k.startswith(f"{gw_id}:")}
 
-    while True:
-        await asyncio.sleep(3600)
+        # Окна, которые уже наступили и ещё не отправлены. Если бот
+        # пропустил несколько окон (например, запуск был за 1ч до дедлайна) —
+        # шлём только самое свежее, остальные помечаем, чтобы не спамить.
+        due = [h for h in REMIND_HOURS
+               if not sent.get(f"{gw_id}:{h}") and now >= deadline - timedelta(hours=h)]
+        if due:
+            latest = min(due)
+            send_message(client, format_message(gw_name, deadline))
+            for notice in EXTRA_NOTICES:
+                send_message(client, notice)
+            for h in due:
+                sent[f"{gw_id}:{h}"] = True
+            log.info(f"Отправлено: {gw_name} за {latest} ч. (+ {len(EXTRA_NOTICES)} доп. уведомления)")
+        else:
+            nxt = [deadline - timedelta(hours=h) for h in REMIND_HOURS
+                   if not sent.get(f"{gw_id}:{h}")]
+            if nxt:
+                log.info(f"{gw_name}: следующее напоминание в {min(nxt):%Y-%m-%d %H:%M} UTC")
+            else:
+                log.info(f"{gw_name}: все напоминания уже отправлены")
+
+        state["sent"] = sent
+    save_state(state)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run()
