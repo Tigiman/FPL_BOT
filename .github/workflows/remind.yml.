@@ -1,0 +1,44 @@
+name: FPL deadline reminder
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # каждые 15 минут (GitHub может задерживать запуск на 5–20 мин)
+  workflow_dispatch:        # ручной запуск из вкладки Actions
+
+permissions:
+  contents: write           # чтобы закоммитить state.json
+
+concurrency:
+  group: fpl-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check deadline and send reminder
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python bot.py
+
+      - name: Commit state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update reminder state [skip ci]"
+            git push
+          fi
