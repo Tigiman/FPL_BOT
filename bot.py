@@ -1,4 +1,4 @@
-"""FPL Deadline Reminder — однократный запуск.
+"""FPL Deadline Reminder — запуск из GitHub Actions.
 
 Скрипт делает одну проверку и завершается. Запускается по расписанию
 из GitHub Actions (.github/workflows/remind.yml). Состояние (какие
@@ -8,6 +8,7 @@
 import os
 import json
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"  # печатать вместо отправки
+# Сколько максимум ждать внутри одного запуска (лимит job в GitHub — 6 ч).
+MAX_WAIT_HOURS = float(os.environ.get("MAX_WAIT_HOURS", "5"))
+# За сколько часов до напоминания начинать ждать/перезапускаться, не
+# надеясь на cron. Больше максимального разрыва между запусками cron (~10 ч).
+CHAIN_HORIZON_HOURS = float(os.environ.get("CHAIN_HORIZON_HOURS", "36"))
 
 REMIND_HOURS = [24, 2]
 
@@ -97,11 +103,9 @@ def send_message(client: httpx.Client, text: str):
 
 
 # ─── ОСНОВНАЯ ПРОВЕРКА ───────────────────────────────────────────────────────
-def run():
-    if not DRY_RUN and not (BOT_TOKEN and CHAT_ID):
-        raise SystemExit("Не заданы BOT_TOKEN / CHAT_ID")
-
-    state = load_state()
+def check(client: httpx.Client, state: dict) -> datetime | None:
+    """Одна проверка: шлёт наступившее напоминание. Возвращает время
+    следующего неотправленного напоминания (или None)."""
     now = datetime.now(timezone.utc)
 
     # Раз в месяц state.json меняется даже без туров (межсезонье), чтобы
@@ -109,39 +113,66 @@ def run():
     # после 60 дней без активности.
     state["keepalive"] = now.strftime("%Y-%m")
 
-    with httpx.Client(timeout=15) as client:
-        result = fetch_next_gw(client)
-        if result is None:
-            log.info("Активных туров не найдено.")
-            save_state(state)
-            return
-        gw_id, gw_name, deadline = result
+    result = fetch_next_gw(client)
+    if result is None:
+        log.info("Активных туров не найдено.")
+        save_state(state)
+        return None
+    gw_id, gw_name, deadline = result
 
-        sent = {k: v for k, v in state.get("sent", {}).items() if k.startswith(f"{gw_id}:")}
+    sent = {k: v for k, v in state.get("sent", {}).items() if k.startswith(f"{gw_id}:")}
 
-        # Окна, которые уже наступили и ещё не отправлены. Если бот
-        # пропустил несколько окон (например, запуск был за 1ч до дедлайна) —
-        # шлём только самое свежее, остальные помечаем, чтобы не спамить.
-        due = [h for h in REMIND_HOURS
-               if not sent.get(f"{gw_id}:{h}") and now >= deadline - timedelta(hours=h)]
-        if due:
-            latest = min(due)
-            send_message(client, format_message(gw_name, deadline))
-            for notice in EXTRA_NOTICES:
-                send_message(client, notice)
-            for h in due:
-                sent[f"{gw_id}:{h}"] = True
-            log.info(f"Отправлено: {gw_name} за {latest} ч. (+ {len(EXTRA_NOTICES)} доп. уведомления)")
-        else:
-            nxt = [deadline - timedelta(hours=h) for h in REMIND_HOURS
-                   if not sent.get(f"{gw_id}:{h}")]
-            if nxt:
-                log.info(f"{gw_name}: следующее напоминание в {min(nxt):%Y-%m-%d %H:%M} UTC")
-            else:
-                log.info(f"{gw_name}: все напоминания уже отправлены")
+    # Окна, которые уже наступили и ещё не отправлены. Если бот
+    # пропустил несколько окон (например, запуск был за 1ч до дедлайна) —
+    # шлём только самое свежее, остальные помечаем, чтобы не спамить.
+    due = [h for h in REMIND_HOURS
+           if not sent.get(f"{gw_id}:{h}") and now >= deadline - timedelta(hours=h)]
+    if due:
+        latest = min(due)
+        send_message(client, format_message(gw_name, deadline))
+        for notice in EXTRA_NOTICES:
+            send_message(client, notice)
+        for h in due:
+            sent[f"{gw_id}:{h}"] = True
+        log.info(f"Отправлено: {gw_name} за {latest} ч. (+ {len(EXTRA_NOTICES)} доп. уведомления)")
 
-        state["sent"] = sent
+    state["sent"] = sent
     save_state(state)
+
+    nxt = [deadline - timedelta(hours=h) for h in REMIND_HOURS if not sent.get(f"{gw_id}:{h}")]
+    if not nxt:
+        log.info(f"{gw_name}: все напоминания уже отправлены")
+        return None
+    log.info(f"{gw_name}: следующее напоминание в {min(nxt):%Y-%m-%d %H:%M} UTC")
+    return min(nxt)
+
+
+def run():
+    """GitHub запускает cron нерегулярно (на практике раз в 2–10 ч), поэтому
+    полагаться только на него нельзя. Если напоминание близко, запуск ждёт
+    его сам (до MAX_WAIT_HOURS), а затем перезапускает workflow
+    (CHAIN=true в GITHUB_OUTPUT), пока перед дедлайном остаются напоминания."""
+    if not DRY_RUN and not (BOT_TOKEN and CHAT_ID):
+        raise SystemExit("Не заданы BOT_TOKEN / CHAT_ID")
+
+    state = load_state()
+    chain = False
+    with httpx.Client(timeout=15) as client:
+        nxt = check(client, state)
+        if nxt and nxt - datetime.now(timezone.utc) <= timedelta(hours=CHAIN_HORIZON_HOURS):
+            wait = min(nxt - datetime.now(timezone.utc), timedelta(hours=MAX_WAIT_HOURS))
+            wait_s = max(0, wait.total_seconds()) + 30
+            log.info(f"Жду {wait_s / 3600:.2f} ч.")
+            time.sleep(wait_s)
+            nxt = check(client, state)
+            chain = bool(nxt and nxt - datetime.now(timezone.utc)
+                         <= timedelta(hours=CHAIN_HORIZON_HOURS))
+
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write(f"chain={'true' if chain else 'false'}\n")
+    log.info(f"Перезапуск цепочки: {chain}")
 
 
 if __name__ == "__main__":
