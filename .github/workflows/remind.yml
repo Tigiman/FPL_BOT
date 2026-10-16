@@ -2,11 +2,12 @@ name: FPL deadline reminder
 
 on:
   schedule:
-    - cron: "*/15 * * * *"  # каждые 15 минут (GitHub может задерживать запуск на 5–20 мин)
-  workflow_dispatch:        # ручной запуск из вкладки Actions
+    - cron: "*/15 * * * *"  # GitHub на практике запускает раз в 2–10 ч — это страховка
+  workflow_dispatch:        # ручной запуск и перезапуск цепочки перед дедлайном
 
 permissions:
   contents: write           # чтобы закоммитить state.json
+  actions: write            # чтобы перезапустить этот workflow
 
 concurrency:
   group: fpl-reminder
@@ -15,11 +16,11 @@ concurrency:
 jobs:
   remind:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 330    # бот может ждать напоминания до 5 ч
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -27,6 +28,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Check deadline and send reminder
+        id: bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -40,5 +42,12 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add state.json
             git commit -m "Update reminder state [skip ci]"
+            git pull --rebase
             git push
           fi
+
+      - name: Restart before deadline
+        if: always() && steps.bot.outputs.chain == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run remind.yml --ref "${{ github.ref_name }}"
